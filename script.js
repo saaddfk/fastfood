@@ -31,6 +31,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
     trainingStatus.textContent = "Initializing...";
 
+    // Attach event listeners for sending messages
+    if (sendButton) {
+        sendButton.addEventListener('click', handleSendMessage);
+    }
+    if (chatInput) {
+        chatInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                // Optionally, prevent default form submission if input is in a form
+                // event.preventDefault();
+                handleSendMessage();
+            }
+        });
+        // Initial state for chat input until model is trained
+        chatInput.disabled = true;
+        sendButton.disabled = true;
+    }
+
     // Start loading data
     loadData(); // Uncommented and active
 });
@@ -148,12 +165,10 @@ function preprocessTextForPrediction(text, currentVocabulary, currentMaxSequence
     // Basic tokenization (should mirror training preprocessing)
     const tokens = text.toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?؟،؛]/g, "").replace(/\s\s+/g, ' ').split(/\s+/).filter(token => token.length > 0 && token !== " ");
 
+    // MODIFIED PART: Map tokens to indices (0 for OOV/padding, 1 to N for words)
     const sequence = tokens.map(token => {
-        const index = currentVocabulary.indexOf(token);
-        return index === -1 ? 0 : index; // Map OOV to 0 (if 0 is padding/OOV)
-                                        // If vocab is 1-indexed and 0 is padding, this should be:
-                                        // return index === -1 ? 0 : index + 1;
-                                        // For now, sticking to 0-indexed vocab and 0 for padding/OOV
+        const index = currentVocabulary.indexOf(token); // index is 0 to N-1 for known
+        return index === -1 ? 0 : index + 1;   // map to 0 for OOV, or 1 to N for known
     });
 
     // Pad sequence (pre-padding)
@@ -242,21 +257,19 @@ function prepareTrainingData(intentsData) {
         trainingStatus.textContent = "Error: Invalid intents data for training.";
         return null;
     }
-    trainingStatus.textContent = "Preparing training data...";
+    trainingStatus.textContent = "Preparing training data (v2 indexing)...";
 
     const words = [];
     const tags = [];
-    const documents = []; // pairs of (pattern_tokens, tag)
+    const documents = [];
 
     intentsData.intents.forEach(intent => {
         if (!tags.includes(intent.tag)) {
             tags.push(intent.tag);
         }
         intent.patterns.forEach(pattern => {
-            // Basic tokenization: lowercase, remove punctuation (simple regex for demo)
-            // In a real app, consider more robust tokenization/normalization
-            const patternText = pattern.replace(/\[.*?\]\(.*?\)/g, '').trim(); // Remove entity annotations like [text](entity)
-            const tokens = patternText.toLowerCase().replace(/[^\w\s؀-ۿ]/g, '').split(/\s+/).filter(token => token.length > 0);
+            const patternText = pattern.replace(/\[.*?\]\(.*?\)/g, '').trim();
+            const tokens = patternText.toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?؟،؛]/g, "").replace(/\s\s+/g, ' ').split(/\s+/).filter(token => token.length > 0 && token !== " ");
 
             if (tokens.length > 0) {
                 words.push(...tokens);
@@ -265,7 +278,7 @@ function prepareTrainingData(intentsData) {
         });
     });
 
-    vocabulary = [...new Set(words)].sort();
+    vocabulary = [...new Set(words)].sort(); // Vocabulary words (0 to N-1 initially)
     numUniqueTags = tags.length;
 
     tagToIndex = {};
@@ -275,16 +288,21 @@ function prepareTrainingData(intentsData) {
         indexToTag[i] = tag;
     });
 
+    console.log("Vocabulary (0-indexed):", vocabulary.slice(0, 10)); // Display how vocab is stored
     console.log("Vocabulary size:", vocabulary.length);
     console.log("Unique tags:", numUniqueTags);
-    console.log("Tag to Index:", tagToIndex);
 
     let trainingSequences = [];
     let trainingLabels = [];
     maxSequenceLength = 0;
 
     documents.forEach(doc => {
-        const sequence = doc.tokens.map(token => vocabulary.indexOf(token));
+        // MODIFIED PART: Map tokens to indices (0 for OOV/padding, 1 to N for words)
+        const sequence = doc.tokens.map(token => {
+            const index = vocabulary.indexOf(token); // index is 0 to N-1 for known words
+            return index === -1 ? 0 : index + 1;   // map to 0 for OOV, or 1 to N for known
+        });
+
         if (sequence.length > maxSequenceLength) {
             maxSequenceLength = sequence.length;
         }
@@ -293,11 +311,14 @@ function prepareTrainingData(intentsData) {
     });
 
     console.log("Max sequence length:", maxSequenceLength);
+    console.log("Sample sequence (1-indexed words, 0 for OOV/pad):", trainingSequences.length > 0 ? trainingSequences[0] : "N/A");
+
 
     // Pad sequences and create one-hot encoded labels
     const paddedSequences = trainingSequences.map(seq => {
-        const padding = Array(maxSequenceLength - seq.length).fill(0);
-        return padding.concat(seq); // Pre-padding
+        const paddingLength = maxSequenceLength - seq.length;
+        const padding = Array(paddingLength).fill(0); // Padding is 0
+        return padding.concat(seq);
     });
 
     const oneHotLabels = trainingLabels.map(labelIndex => {
@@ -312,27 +333,23 @@ function prepareTrainingData(intentsData) {
         return null;
     }
 
-    // Create Tensors
     try {
+        if (X_train_tensor) X_train_tensor.dispose(); // Dispose previous tensor if any
         X_train_tensor = tf.tensor2d(paddedSequences, [paddedSequences.length, maxSequenceLength], 'int32');
+
+        if (y_train_tensor) y_train_tensor.dispose(); // Dispose previous tensor if any
         y_train_tensor = tf.tensor2d(oneHotLabels, [oneHotLabels.length, numUniqueTags], 'float32');
     } catch (error) {
         console.error("Error creating tensors:", error);
-        console.error("Padded sequences sample:", paddedSequences.slice(0,1));
-        console.error("One-hot labels sample:", oneHotLabels.slice(0,1));
         trainingStatus.textContent = "Error creating training tensors.";
         return null;
     }
 
-
-    console.log("X_train tensor shape:", X_train_tensor.shape);
+    console.log("X_train tensor (1-idx words) shape:", X_train_tensor.shape);
     console.log("y_train tensor shape:", y_train_tensor.shape);
-    trainingStatus.textContent = "Training data prepared. Creating NLU model...";
+    trainingStatus.textContent = "Training data prepared (v2 indexing). Creating NLU model...";
 
-    // Store globally (already done for vocabulary, tagToIndex, indexToTag, maxSequenceLength, numUniqueTags)
-    // X_train_tensor and y_train_tensor are also global
-
-    return { X_train_tensor, y_train_tensor }; // Return tensors as they are needed by the training function
+    return { X_train_tensor, y_train_tensor };
 }
 
 // Make sure this is added after prepareTrainingData
@@ -343,13 +360,13 @@ function createNLUModel(currentVocabularySize, embeddingDim, currentMaxSequenceL
         trainingStatus.textContent = "Error: Cannot create model due to invalid dimensions.";
         return null;
     }
-    trainingStatus.textContent = "Creating NLU model...";
+    trainingStatus.textContent = "Creating NLU model (v2 indexing)...";
 
     const model = tf.sequential();
 
-    // Embedding Layer
+    // MODIFIED PART: Embedding Layer inputDim
     model.add(tf.layers.embedding({
-        inputDim: currentVocabularySize, // Size of the vocabulary
+        inputDim: currentVocabularySize + 1, // Size of the vocabulary + 1 for padding/OOV at index 0
         outputDim: embeddingDim,         // Dimension of the dense embedding
         inputLength: currentMaxSequenceLength // Length of input sequences
     }));
@@ -380,8 +397,8 @@ function createNLUModel(currentVocabularySize, embeddingDim, currentMaxSequenceL
     });
 
     model.summary(); // Log model summary to console
-    console.log("NLU Model created and compiled.");
-    trainingStatus.textContent = "NLU model created. Ready for training.";
+    console.log("NLU Model (v2 indexing) created and compiled.");
+    trainingStatus.textContent = "NLU model (v2 indexing) created. Ready for training.";
 
     return model;
 }
@@ -428,6 +445,123 @@ async function trainNLUModel(model, X_train, y_train) {
         console.error("Error during model training:", error);
         trainingStatus.textContent = `Error during training: ${error.message}`;
         if (trainModelButton) trainModelButton.disabled = false;
+    }
+}
+
+// Make sure this is added before handleSendMessage or any other function that might use it.
+// Typically, helper functions like this are defined earlier in the script or grouped together.
+
+function displayMessage(text, sender) {
+    if (!chatMessages) {
+        console.error("Chat messages container not found!");
+        return;
+    }
+    const messageDiv = document.createElement('div');
+    messageDiv.classList.add('message', sender); // sender will be 'user' or 'bot'
+
+    // Sanitize text before setting it as textContent to prevent XSS if the source is ever not trusted.
+    // For this application, text is either from user input (which is fine for textContent)
+    // or from our JSON files (assumed to be safe).
+    // If responses could contain HTML, more robust sanitization would be needed.
+    messageDiv.textContent = text;
+
+    chatMessages.appendChild(messageDiv);
+
+    // Auto-scroll to the bottom
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// Make sure this is added after displayMessage, predictIntentTFJS, and global variables like allMenuItems, allIntents are defined.
+
+async function handleSendMessage() {
+    if (!chatInput || !chatMessages) {
+        console.error("Chat input or messages container not found.");
+        return;
+    }
+    const userText = chatInput.value.trim();
+    if (userText === "") {
+        return;
+    }
+
+    displayMessage(userText, 'user');
+    chatInput.value = ""; // Clear input field
+
+    // Disable input while bot is "thinking"
+    chatInput.disabled = true;
+    if (sendButton) sendButton.disabled = true;
+
+    try {
+        const prediction = await predictIntentTFJS(userText);
+        let botResponse = "";
+        const confidenceThreshold = 0.6; // Example threshold
+
+        if (prediction && prediction.confidence > confidenceThreshold) {
+            const intentTag = prediction.intentTag;
+            const intentDetails = allIntents.intents.find(intent => intent.tag === intentTag);
+
+            if (intentTag === 'ask_price' || intentTag === 'ask_ingredients') {
+                let foundItemName = null;
+                const userTextLower = userText.toLowerCase();
+                for (const itemName in allMenuItems) {
+                    if (userTextLower.includes(itemName.toLowerCase())) {
+                        foundItemName = itemName;
+                        break;
+                    }
+                }
+
+                if (foundItemName && allMenuItems[foundItemName]) {
+                    if (intentTag === 'ask_price') {
+                        botResponse = `The price of ${foundItemName} is ${allMenuItems[foundItemName].price}.`;
+                    } else { // ask_ingredients
+                        const ingredients = allMenuItems[foundItemName].ingredients;
+                        if (ingredients && ingredients.length > 0) {
+                            botResponse = `The ingredients for ${foundItemName} are: ${ingredients.join(', ')}.`;
+                        } else {
+                            botResponse = `I don't have the ingredient information for ${foundItemName}.`;
+                        }
+                    }
+                } else {
+                    // Fallback to generic response for the intent if item not found
+                    if (intentDetails && intentDetails.responses.length > 0) {
+                        botResponse = intentDetails.responses[Math.floor(Math.random() * intentDetails.responses.length)];
+                         // Add a note if it was looking for an item
+                        if (intentTag === 'ask_price') botResponse += " Which item's price are you asking about?";
+                        if (intentTag === 'ask_ingredients') botResponse += " Which item's ingredients are you asking about?";
+                    } else {
+                        botResponse = "I can help with prices and ingredients. Which item are you interested in?";
+                    }
+                }
+            } else if (intentDetails && intentDetails.responses.length > 0) {
+                // For other intents, select a random response
+                botResponse = intentDetails.responses[Math.floor(Math.random() * intentDetails.responses.length)];
+            } else {
+                // Fallback if intent is recognized but has no specific responses defined (should not happen with good intents.json)
+                botResponse = "I understood that, but I don't have a specific response prepared.";
+            }
+        } else if (prediction && prediction.intentTag === 'fallback_not_ready') {
+             botResponse = "The NLU model is not ready yet. Please try again after it's trained.";
+        } else if (prediction && prediction.intentTag && prediction.intentTag.startsWith('fallback_error')) {
+            botResponse = "Sorry, I encountered an internal error trying to understand that.";
+            console.error("Fallback error from predictIntentTFJS:", prediction.intentTag);
+        }
+        else {
+            // Low confidence or other fallback
+            botResponse = "I'm not quite sure how to respond to that. Can you try rephrasing, or ask about menu items?";
+            if (prediction) { // Log if there was a prediction, even if low confidence
+                 console.log(`Low confidence prediction: ${prediction.intentTag} (${prediction.confidence.toFixed(3)})`);
+            }
+        }
+
+        displayMessage(botResponse, 'bot');
+
+    } catch (error) {
+        console.error("Error in handleSendMessage:", error);
+        displayMessage("Sorry, something went wrong on my end.", 'bot');
+    } finally {
+        // Re-enable input
+        chatInput.disabled = false;
+        if (sendButton) sendButton.disabled = false;
+        chatInput.focus();
     }
 }
 
